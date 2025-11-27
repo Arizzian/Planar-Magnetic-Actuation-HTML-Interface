@@ -1,0 +1,166 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Magnet Grid — Controller</title>
+<style>
+  body{font-family:system-ui; margin:18px}
+  #controls{display:flex; gap:12px; align-items:center; margin-bottom:12px; flex-wrap:wrap}
+  input[type=number]{width:64px}
+  canvas{border:1px solid #ccc; display:block}
+  button{padding:6px 10px}
+</style>
+</head>
+<body>
+<h2>Electromagnet Grid Controller</h2>
+<div id="controls">
+  From: <input id="fromR" type="number" min="0" value="0"> , <input id="fromC" type="number" min="0" value="0">
+  To: <input id="toR" type="number" min="0" value="7"> , <input id="toC" type="number" min="0" value="7">
+  Speed(ms/step): <input id="speed" type="number" min="10" value="120">
+  Intensity(0-255): <input id="intensity" type="number" min="0" max="255" value="200">
+  Thickness(cells): <input id="thick" type="number" step="0.1" min="0" value="0.0">
+  <button id="btnMove">Move</button>
+  <button id="btnSendEnd">Send End Only</button>
+  <button id="btnStop">EMERGENCY STOP</button>
+</div>
+
+<canvas id="grid" width="480" height="480"></canvas>
+<script>
+// CONFIG
+const rows = 8, cols = 8;
+const canvas = document.getElementById('grid');
+const ctx = canvas.getContext('2d');
+let cells = new Array(rows*cols).fill(0);
+
+// websocket: connect to same host that served the page
+const ws = new WebSocket(`ws://${location.host}/ws`);
+ws.onopen = ()=> console.log('ws open');
+ws.onmessage = (evt)=> {
+  try {
+    const obj = JSON.parse(evt.data);
+    if(obj.type === 'grid' && obj.cells){
+      cells = obj.cells;
+      draw();
+    }
+  } catch(e){ console.warn(e); }
+};
+
+function draw(){
+  const w = canvas.width, h = canvas.height;
+  const cw = w/cols, ch = h/rows;
+  ctx.clearRect(0,0,w,h);
+  for(let r=0;r<rows;r++) for(let c=0;c<cols;c++){
+    const v = cells[r*cols + c] || 0;
+    ctx.fillStyle = `rgb(${v},${255 - v}, 0)`;
+    ctx.fillRect(c*cw + 1, r*ch + 1, cw - 2, ch - 2);
+  }
+}
+draw();
+
+const clamp = (x,a,b) => Math.max(a, Math.min(b, x));
+
+// DDA
+function lineDDA(r0,c0,r1,c1){
+  const path = [];
+  const dx = c1 - c0, dy = r1 - r0;
+  const steps = Math.max(Math.abs(dx), Math.abs(dy));
+  if(steps === 0) { path.push({r:r0,c:c0}); return path; }
+  const xInc = dx / steps, yInc = dy / steps;
+  let x = c0, y = r0;
+  for(let i=0;i<=steps;i++){
+    const rc = Math.round(y), cc = Math.round(x);
+    path.push({r: clamp(rc,0,rows-1), c: clamp(cc,0,cols-1)});
+    x += xInc; y += yInc;
+  }
+  return path.filter((p,i,arr)=> i===0 || (p.r !== arr[i-1].r || p.c !== arr[i-1].c));
+}
+
+// point-to-segment dist
+function pointToSegmentDist(px,py, ax,ay, bx,by){
+  const vx = bx - ax, vy = by - ay;
+  const wx = px - ax, wy = py - ay;
+  const c1 = vx*wx + vy*wy;
+  if(c1 <= 0) return Math.hypot(px-ax, py-ay);
+  const c2 = vx*vx + vy*vy;
+  if(c2 <= c1) return Math.hypot(px-bx, py-by);
+  const t = c1 / c2;
+  const projx = ax + t * vx, projy = ay + t * vy;
+  return Math.hypot(px - projx, py - projy);
+}
+
+// thickPath
+function thickPath(r0,c0,r1,c1,thick){
+  const cellsMap = {};
+  const minR = Math.max(0, Math.floor(Math.min(r0, r1) - thick - 1));
+  const maxR = Math.min(rows-1, Math.ceil(Math.max(r0, r1) + thick + 1));
+  const minC = Math.max(0, Math.floor(Math.min(c0, c1) - thick - 1));
+  const maxC = Math.min(cols-1, Math.ceil(Math.max(c0, c1) + thick + 1));
+  for(let r=minR; r<=maxR; r++){
+    for(let c=minC; c<=maxC; c++){
+      const centerR = r + 0.5, centerC = c + 0.5;
+      const dist = pointToSegmentDist(centerC, centerR, c0+0.5, r0+0.5, c1+0.5, r1+0.5);
+      if(dist <= thick + 0.7071) cellsMap[`${r},${c}`] = {r,c};
+    }
+  }
+  // order by projection
+  const vx = (c1+0.5) - (c0+0.5), vy = (r1+0.5) - (r0+0.5);
+  const A = [];
+  for(const k in cellsMap){
+    const v = cellsMap[k];
+    const wx = (v.c+0.5) - (c0+0.5), wy = (v.r+0.5) - (r0+0.5);
+    const t = (wx*vx + wy*vy) / (vx*vx + vy*vy || 1);
+    A.push({cell:v, t});
+  }
+  A.sort((a,b)=> a.t - b.t);
+  const path = [];
+  const seen = new Set();
+  for(const it of A){
+    const key = `${it.cell.r},${it.cell.c}`;
+    if(!seen.has(key)){ path.push(it.cell); seen.add(key); }
+  }
+  return path;
+}
+
+document.getElementById('btnMove').onclick = ()=>{
+  const r0 = parseInt(document.getElementById('fromR').value,10);
+  const c0 = parseInt(document.getElementById('fromC').value,10);
+  const r1 = parseInt(document.getElementById('toR').value,10);
+  const c1 = parseInt(document.getElementById('toC').value,10);
+  const speed = parseInt(document.getElementById('speed').value,10) || 120;
+  const intensity = parseInt(document.getElementById('intensity').value,10) || 200;
+  const thick = parseFloat(document.getElementById('thick').value) || 0.0;
+  const path = (thick > 0) ? thickPath(r0,c0,r1,c1, thick) : lineDDA(r0,c0,r1,c1);
+  ws.send(JSON.stringify({type:'cmd', action:'move_path', path, speed_ms: speed, intensity: intensity}));
+  console.log('sent', path);
+};
+
+document.getElementById('btnSendEnd').onclick = ()=>{
+  const r0 = parseInt(document.getElementById('fromR').value,10);
+  const c0 = parseInt(document.getElementById('fromC').value,10);
+  const r1 = parseInt(document.getElementById('toR').value,10);
+  const c1 = parseInt(document.getElementById('toC').value,10);
+  const speed = parseInt(document.getElementById('speed').value,10) || 120;
+  const intensity = parseInt(document.getElementById('intensity').value,10) || 200;
+  const thick = parseFloat(document.getElementById('thick').value) || 0.0;
+  ws.send(JSON.stringify({type:'cmd', action:'move_to',
+    from:{r:r0,c:c0}, to:{r:r1,c:c1}, speed_ms: speed, intensity: intensity, thickness: thick}));
+  console.log('sent end-only move_to');
+};
+
+document.getElementById('btnStop').onclick = ()=>{
+  ws.send(JSON.stringify({type:'cmd', action:'stop'}));
+};
+
+canvas.addEventListener('click', ev=>{
+  const rect = canvas.getBoundingClientRect();
+  const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+  const c = Math.floor(x / (canvas.width/cols));
+  const r = Math.floor(y / (canvas.height/rows));
+  document.getElementById('toR').value = r;
+  document.getElementById('toC').value = c;
+});
+
+setInterval(draw, 100);
+</script>
+</body>
+</html>
